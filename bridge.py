@@ -8,6 +8,7 @@ import wave
 from typing import Optional
 
 import aiohttp
+import msgpack
 import numpy as np
 import websockets
 from aiohttp import ClientSession
@@ -130,6 +131,14 @@ async def handle_ws(websocket):
     buf = AudioBuffer()
     
     logging.info("New WebSocket connection established")
+
+    # Unmute expects an immediate msgpack-encoded Ready message to complete
+    # the ServiceWithStartup handshake; without this, the client times out
+    # and reports a capacity/timeout error. Send it right away.
+    try:
+        await websocket.send(msgpack.packb({"type": "Ready"}))
+    except Exception as e:
+        logging.error(f"Failed to send Ready message: {e}")
 
     async with aiohttp.ClientSession() as session:
         try:

@@ -2,3 +2,4 @@ websockets==12.0
 aiohttp==3.9.5
 numpy==2.1.1
 opuslib==3.0.1
+msgpack==1.0.8
