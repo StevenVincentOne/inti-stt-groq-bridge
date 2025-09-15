@@ -11,10 +11,11 @@ import aiohttp
 import msgpack
 import numpy as np
 import websockets
-from aiohttp import ClientSession
+from aiohttp import ClientSession, TCPConnector
 from websockets.server import serve
 from websockets.http import Headers
 import opuslib
+import socket
 
 logging.basicConfig(level=logging.INFO)
 
@@ -140,7 +141,9 @@ async def handle_ws(websocket):
     except Exception as e:
         logging.error(f"Failed to send Ready message: {e}")
 
-    async with aiohttp.ClientSession() as session:
+    # Force IPv4-only connections to prevent IPv6 connectivity issues
+    connector = TCPConnector(family=socket.AF_INET)
+    async with aiohttp.ClientSession(connector=connector) as session:
         try:
             while True:
                 msg = await websocket.recv()
