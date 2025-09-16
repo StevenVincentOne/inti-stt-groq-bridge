@@ -102,18 +102,59 @@ class AudioBuffer:
             num_samples = len(self._buf.getvalue()) // 2
             return num_samples / SAMPLE_RATE
 
-async def transcribe(session: ClientSession, wav_bytes: bytes) -> Optional[str]:
-    data = aiohttp.FormData()
-    data.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
-    data.add_field("model", GROQ_STT_MODEL)
-    data.add_field("response_format", "json")
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    async with session.post(GROQ_STT_URL, headers=headers, data=data, timeout=aiohttp.ClientTimeout(total=90)) as resp:
-        if resp.status != 200:
-            logging.error("Groq STT failed: %s %s", resp.status, await resp.text())
+async def transcribe(session: ClientSession, wav_bytes: bytes, max_retries: int = 3) -> Optional[str]:
+    """Send WAV audio to Groq for transcription with retry logic for rate limits"""
+    
+    for attempt in range(max_retries):
+        try:
+            data = aiohttp.FormData()
+            data.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
+            data.add_field("model", GROQ_STT_MODEL)
+            data.add_field("response_format", "json")
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+            
+            async with session.post(GROQ_STT_URL, headers=headers, data=data, timeout=aiohttp.ClientTimeout(total=90)) as resp:
+                if resp.status == 200:
+                    body = await resp.json()
+                    return body.get("text")
+                elif resp.status == 429:  # Rate limit
+                    error_text = await resp.text()
+                    logging.warning(f"Groq rate limit hit (attempt {attempt + 1}/{max_retries}): {error_text}")
+                    
+                    # Parse retry delay from error message or use default
+                    retry_delay = 3.0  # Default 3 seconds
+                    try:
+                        import json
+                        import re
+                        error_data = json.loads(error_text)
+                        if "error" in error_data and "message" in error_data["error"]:
+                            message = error_data["error"]["message"]
+                            # Look for "try again in X.Xs" pattern
+                            match = re.search(r'try again in (\d+\.?\d*)s', message)
+                            if match:
+                                retry_delay = float(match.group(1)) + 0.5  # Add small buffer
+                    except Exception:
+                        pass
+                    
+                    if attempt < max_retries - 1:  # Don't wait on last attempt
+                        logging.info(f"Waiting {retry_delay}s before retry...")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    else:
+                        logging.error("Max retries exceeded for rate limit")
+                        return None
+                else:
+                    error_text = await resp.text()
+                    logging.error("Groq STT failed: %s %s", resp.status, error_text)
+                    return None
+        except Exception as e:
+            logging.error(f"Groq STT error (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1.0)  # Brief wait before retry
+                continue
             return None
-        body = await resp.json()
-        return body.get("text")
+    
+    return None
 
 def pcm16_wav_bytes(pcm_bytes: bytes, sample_rate: int) -> bytes:
     out = io.BytesIO()
