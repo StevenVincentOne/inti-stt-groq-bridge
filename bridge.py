@@ -102,8 +102,8 @@ class AudioBuffer:
             num_samples = len(self._buf.getvalue()) // 2
             return num_samples / SAMPLE_RATE
 
-async def transcribe(session: ClientSession, wav_bytes: bytes, max_retries: int = 3) -> Optional[str]:
-    """Send WAV audio to Groq for transcription with retry logic for rate limits"""
+async def transcribe(session: ClientSession, wav_bytes: bytes, max_retries: int = 2) -> Optional[str]:
+    """Send WAV audio to Groq for transcription with conservative retry logic"""
     
     for attempt in range(max_retries):
         try:
@@ -117,12 +117,12 @@ async def transcribe(session: ClientSession, wav_bytes: bytes, max_retries: int 
                 if resp.status == 200:
                     body = await resp.json()
                     return body.get("text")
-                elif resp.status == 429:  # Rate limit
+                elif resp.status == 429:  # Rate limit - should be rare with developer account
                     error_text = await resp.text()
-                    logging.warning(f"Groq rate limit hit (attempt {attempt + 1}/{max_retries}): {error_text}")
+                    logging.warning(f"[RATE_LIMIT] Groq rate limit hit (attempt {attempt + 1}/{max_retries}) - Developer account may need upgrade")
                     
-                    # Parse retry delay from error message or use default
-                    retry_delay = 3.0  # Default 3 seconds
+                    # Parse retry delay from error message
+                    retry_delay = 2.0  # Conservative default
                     try:
                         import json
                         import re
@@ -132,26 +132,48 @@ async def transcribe(session: ClientSession, wav_bytes: bytes, max_retries: int 
                             # Look for "try again in X.Xs" pattern
                             match = re.search(r'try again in (\d+\.?\d*)s', message)
                             if match:
-                                retry_delay = float(match.group(1)) + 0.5  # Add small buffer
+                                retry_delay = min(float(match.group(1)) + 0.3, 5.0)  # Cap at 5s max
                     except Exception:
                         pass
                     
-                    if attempt < max_retries - 1:  # Don't wait on last attempt
-                        logging.info(f"Waiting {retry_delay}s before retry...")
+                    if attempt < max_retries - 1:
+                        logging.info(f"[RETRY] Waiting {retry_delay}s before retry...")
                         await asyncio.sleep(retry_delay)
                         continue
                     else:
-                        logging.error("Max retries exceeded for rate limit")
+                        logging.error("[RETRY_EXHAUSTED] Max retries exceeded for rate limit")
+                        return None
+                elif resp.status >= 500:  # Server errors - worth retrying
+                    error_text = await resp.text()
+                    logging.warning(f"[SERVER_ERROR] Groq server error {resp.status} (attempt {attempt + 1}/{max_retries}): {error_text}")
+                    
+                    if attempt < max_retries - 1:
+                        # Exponential backoff for server errors
+                        retry_delay = min(1.0 * (2 ** attempt), 3.0)  # 1s, 2s max
+                        logging.info(f"[RETRY] Waiting {retry_delay}s before retry...")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    else:
+                        logging.error(f"[SERVER_ERROR] Max retries exceeded for server error {resp.status}")
                         return None
                 else:
+                    # Client errors (4xx except 429) - don't retry
                     error_text = await resp.text()
-                    logging.error("Groq STT failed: %s %s", resp.status, error_text)
+                    logging.error(f"[CLIENT_ERROR] Groq STT failed with {resp.status} (no retry): {error_text}")
                     return None
-        except Exception as e:
-            logging.error(f"Groq STT error (attempt {attempt + 1}/{max_retries}): {e}")
+        except (aiohttp.ClientTimeout, aiohttp.ClientError) as e:
+            logging.warning(f"[NETWORK_ERROR] Groq STT network error (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
-                await asyncio.sleep(1.0)  # Brief wait before retry
+                retry_delay = 1.0 * (attempt + 1)  # 1s, 2s
+                logging.info(f"[RETRY] Waiting {retry_delay}s before retry...")
+                await asyncio.sleep(retry_delay)
                 continue
+            else:
+                logging.error("[NETWORK_ERROR] Max retries exceeded for network error")
+                return None
+        except Exception as e:
+            # Unexpected errors - don't retry, fail fast
+            logging.error(f"[UNEXPECTED_ERROR] Groq STT unexpected error: {e}")
             return None
     
     return None
