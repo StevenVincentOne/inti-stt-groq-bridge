@@ -91,6 +91,16 @@ class AudioBuffer:
         self.pcm_collector.clear()
         self._buf.seek(0)
         self._buf.truncate(0)
+    
+    def get_duration_seconds(self) -> float:
+        """Calculate buffer duration in seconds"""
+        if self.pcm_collector:
+            total_samples = sum(len(arr) for arr in self.pcm_collector)
+            return total_samples / SAMPLE_RATE
+        else:
+            # Fallback for raw buffer (PCM16 = 2 bytes per sample)
+            num_samples = len(self._buf.getvalue()) // 2
+            return num_samples / SAMPLE_RATE
 
 async def transcribe(session: ClientSession, wav_bytes: bytes) -> Optional[str]:
     data = aiohttp.FormData()
@@ -127,6 +137,43 @@ def to_pcm16_from_unknown(data: bytes) -> bytes:
             pass
     # Otherwise assume PCM16 already
     return data
+
+async def process_transcription(session: ClientSession, websocket, buf: AudioBuffer, marker_id: Optional[int] = None):
+    """Process accumulated audio and send Unmute-compatible transcription messages"""
+    pcm_bytes = buf.get_pcm_data()
+    
+    if not pcm_bytes:
+        logging.warning("No audio data to transcribe")
+        return
+
+    logging.info(f"Transcribing {len(pcm_bytes)} bytes of PCM data")
+    
+    # Convert to WAV and send to Groq
+    wav_bytes = pcm16_wav_bytes(pcm_bytes, SAMPLE_RATE)
+    text = await transcribe(session, wav_bytes)
+    
+    if text is None:
+        logging.error("Transcription failed")
+        # Send error in Unmute format
+        error_msg = msgpack.packb({"type": "Error", "message": "transcription failed"})
+        await websocket.send(error_msg)
+        return
+
+    logging.info(f"Transcription successful: {text[:100]}...")
+    
+    # Send transcription in Unmute STTWordMessage format
+    if text.strip():
+        word_msg = msgpack.packb({
+            "type": "Word",
+            "text": text.strip(),
+            "start_time": 0.0  # Simplified - could calculate based on audio length
+        })
+        await websocket.send(word_msg)
+    
+    # Send marker response if marker was provided
+    if marker_id is not None:
+        marker_msg = msgpack.packb({"type": "Marker", "id": marker_id})
+        await websocket.send(marker_msg)
 
 async def handle_ws(websocket):
     buf = AudioBuffer()
@@ -172,6 +219,30 @@ async def handle_ws(websocket):
                             logging.debug(f"Processed Opus frame: {len(opus_data)} bytes")
                         except Exception as e:
                             logging.warning(f"Failed to process audio frame: {e}")
+
+                elif t == "Audio":
+                    # Unmute protocol: {"type": "Audio", "pcm": [float32_array]}
+                    pcm_data = payload.get("pcm")
+                    if pcm_data:
+                        try:
+                            # Convert float32 list to PCM16 bytes
+                            float32_array = np.array(pcm_data, dtype=np.float32)
+                            pcm16_array = (np.clip(float32_array, -1.0, 1.0) * 32767.0).astype(np.int16)
+                            buf.append_bytes(pcm16_array.tobytes())
+                            logging.debug(f"Processed PCM frame: {len(pcm_data)} samples")
+                            
+                            # Auto-trigger transcription when buffer reaches ~3 seconds
+                            if buf.get_duration_seconds() >= 3.0:
+                                await process_transcription(session, websocket, buf)
+                        except Exception as e:
+                            logging.warning(f"Failed to process PCM frame: {e}")
+
+                elif t == "Marker":
+                    # Unmute protocol: {"type": "Marker", "id": marker_id}
+                    # Trigger transcription when marker received
+                    marker_id = payload.get("id", 0)
+                    logging.info(f"Processing marker {marker_id}, triggering transcription")
+                    await process_transcription(session, websocket, buf, marker_id)
 
                 elif t in ("end", "end_audio", "InputAudioBufferCommit", "input_audio_buffer.commit"):
                     logging.info("Processing audio commit/end event")
