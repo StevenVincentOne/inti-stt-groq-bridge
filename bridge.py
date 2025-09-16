@@ -212,11 +212,11 @@ async def handle_ws(websocket):
                                     buf.append_bytes(pcm16_array.tobytes())
                                     logging.info(f"Processed PCM frame: {len(pcm_data)} samples")
                                     
-                                    # Auto-trigger transcription when buffer reaches ~3 seconds
-                                    if buf.get_duration_seconds() >= 3.0:
-                                        await process_transcription(session, websocket, buf)
-                                except Exception as e:
-                                    logging.warning(f"Failed to process PCM frame: {e}")
+                            # Auto-trigger transcription when buffer reaches ~0.5 seconds (faster response)
+                            if buf.get_duration_seconds() >= 0.5:
+                                await process_transcription(session, websocket, buf)
+                        except Exception as e:
+                            logging.warning(f"Failed to process PCM frame: {e}")
                         elif t == "Marker":
                             # Unmute protocol: {"type": "Marker", "id": marker_id}
                             marker_id = msgpack_data.get("id", 0)
@@ -265,8 +265,8 @@ async def handle_ws(websocket):
                             buf.append_bytes(pcm16_array.tobytes())
                             logging.debug(f"Processed PCM frame: {len(pcm_data)} samples")
                             
-                            # Auto-trigger transcription when buffer reaches ~3 seconds
-                            if buf.get_duration_seconds() >= 3.0:
+                            # Auto-trigger transcription when buffer reaches ~0.5 seconds (faster response)
+                            if buf.get_duration_seconds() >= 0.5:
                                 await process_transcription(session, websocket, buf)
                         except Exception as e:
                             logging.warning(f"Failed to process PCM frame: {e}")
