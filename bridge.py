@@ -17,7 +17,7 @@ from websockets.http import Headers
 import opuslib
 import socket
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY") or os.environ.get("OPENAI_API_KEY") or os.environ.get("KYUTAI_LLM_API_KEY")
 GROQ_STT_URL = os.environ.get("GROQ_STT_URL", "https://api.groq.com/openai/v1/audio/transcriptions")
@@ -195,18 +195,52 @@ async def handle_ws(websocket):
             while True:
                 msg = await websocket.recv()
                 if isinstance(msg, bytes):
-                    # Legacy binary frame support
-                    buf.append_bytes(msg)
-                    continue
+                    # Check if it's msgpack (Unmute backend protocol)
+                    try:
+                        msgpack_data = msgpack.unpackb(msg)
+                        logging.info(f"Received msgpack message: {msgpack_data}")
+                        
+                        t = msgpack_data.get("type")
+                        if t == "Audio":
+                            # Unmute protocol: {"type": "Audio", "pcm": [float32_array]}
+                            pcm_data = msgpack_data.get("pcm")
+                            if pcm_data:
+                                try:
+                                    # Convert float32 list to PCM16 bytes
+                                    float32_array = np.array(pcm_data, dtype=np.float32)
+                                    pcm16_array = (np.clip(float32_array, -1.0, 1.0) * 32767.0).astype(np.int16)
+                                    buf.append_bytes(pcm16_array.tobytes())
+                                    logging.info(f"Processed PCM frame: {len(pcm_data)} samples")
+                                    
+                                    # Auto-trigger transcription when buffer reaches ~3 seconds
+                                    if buf.get_duration_seconds() >= 3.0:
+                                        await process_transcription(session, websocket, buf)
+                                except Exception as e:
+                                    logging.warning(f"Failed to process PCM frame: {e}")
+                        elif t == "Marker":
+                            # Unmute protocol: {"type": "Marker", "id": marker_id}
+                            marker_id = msgpack_data.get("id", 0)
+                            logging.info(f"Processing marker {marker_id}, triggering transcription")
+                            await process_transcription(session, websocket, buf, marker_id)
+                        else:
+                            logging.debug(f"Unknown msgpack message type: {t}")
+                        continue
+                    except Exception as e:
+                        logging.debug(f"Not msgpack, treating as binary: {e}")
+                        # Legacy binary frame support
+                        buf.append_bytes(msg)
+                        logging.debug(f"Processed binary frame: {len(msg)} bytes")
+                        continue
                     
                 try:
                     payload = json.loads(msg)
+                    logging.debug(f"Received JSON message: {msg[:200]}...")
                 except Exception as e:
                     logging.warning(f"Failed to parse JSON message: {e}")
                     continue
 
                 t = payload.get("type")
-                logging.debug(f"Received message type: {t}")
+                logging.info(f"Received message type: {t}")
                 
                 if t in ("InputAudioBufferAppend", "input_audio_buffer.append", "append"):
                     b64_audio = payload.get("audio") or payload.get("data")
